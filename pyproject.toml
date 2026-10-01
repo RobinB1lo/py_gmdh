@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "py_gmdh"
+version = "0.0.1"
+authors = [
+  { name="Robin Bilodeau", email="robin.bilo13@gmail.com" },
+]
+description = "Python implementation of the Group Method of Data Handling algorithm"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.22",
+    "scipy>=1.8",
+    "sympy>=1.10",
+    "scikit-learn>=1.0",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+license = "MIT"
+license-files = ["LICEN[CS]E*"]
+
+[project.optional-dependencies]
+test = ["pytest", "pandas"]
+
+[project.urls]
+Homepage = "https://github.com/RobinB1lo/py_gmdh"
+Issues = "https://github.com/RobinB1lo/py_gmdh/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/py_gmdh"]
