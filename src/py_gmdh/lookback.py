@@ -1,12 +1,14 @@
 """GMDH whose neurons may connect to nodes from any earlier layer."""
 
+from __future__ import annotations
+
 from itertools import combinations, count
 from typing import Dict, List, Optional
 
 import numpy as np
-import sympy as sp
 
 from ._base import GMDHClassifierBase, GMDHRegressorBase, Neuron
+from ._lazy import sp
 
 _SCOPES = ("all", "inputs")
 

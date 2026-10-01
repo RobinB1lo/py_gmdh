@@ -1,11 +1,13 @@
 """GMDH with constrained fractional polynomial neurons."""
 
+from __future__ import annotations
+
 from typing import Optional, Sequence
 
 import numpy as np
-import sympy as sp
 
 from ._base import GMDHClassifierBase, GMDHRegressorBase, Neuron
+from ._lazy import sp
 
 DEFAULT_POWERS = (-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0)
 _ZERO_EPS = 1e-10

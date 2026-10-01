@@ -8,17 +8,19 @@ terms) and ranked by an external criterion; the model with the lowest
 criterion over all complexity levels is selected.
 """
 
+from __future__ import annotations
+
 import warnings
 from itertools import combinations
 from math import comb
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import sympy as sp
-from scipy.special import expit
 
 from ._base import (_LOGIT_CLIP, _PROBA_EPS, LOGISTIC, GMDHClassifierBase, GMDHRegressorBase,
                     _format_expr, _logistic_solve, _ridge_solve, _sigmoid_expression)
+from ._lazy import sp
+from ._logistic import sigmoid
 
 Term = Tuple[int, ...]
 
@@ -196,7 +198,7 @@ class _CombinatorialSearch:
             active = np.ones(len(idx), dtype=bool)
             for _ in range(_NEWTON_ITERATIONS):
                 Xa, Xta, wa = X[active], Xt[active], w[active]
-                p = expit(np.clip((Xa @ wa[:, :, None])[:, :, 0], -_LOGIT_CLIP, _LOGIT_CLIP))
+                p = sigmoid(np.clip((Xa @ wa[:, :, None])[:, :, 0], -_LOGIT_CLIP, _LOGIT_CLIP))
                 grad = (Xta @ (p - y_tr)[:, :, None])[:, :, 0] + ridge * wa
                 hess = Xta @ (Xa * (p * (1 - p))[:, :, None]) + ridge * np.eye(m)
                 step = np.clip(_batch_solve(hess, grad), -10.0, 10.0)
@@ -207,7 +209,7 @@ class _CombinatorialSearch:
                     break
             z = np.clip((np.transpose(P_se[:, idx], (1, 0, 2)) @ w[:, :, None])[:, :, 0],
                         -_LOGIT_CLIP, _LOGIT_CLIP)
-            p = np.clip(expit(z), _PROBA_EPS, 1 - _PROBA_EPS)
+            p = np.clip(sigmoid(z), _PROBA_EPS, 1 - _PROBA_EPS)
             return -np.mean(y_se * np.log(p) + (1 - y_se) * np.log(1 - p), axis=1)
 
         score.rows = len(y_tr)

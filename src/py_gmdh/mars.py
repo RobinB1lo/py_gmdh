@@ -5,12 +5,14 @@ functions ``max(0, ±(x - t))`` and their pairwise products are added by a
 greedy forward pass and pruned by generalized cross-validation (GCV).
 """
 
+from __future__ import annotations
+
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
-import sympy as sp
 
 from ._base import GMDHClassifierBase, GMDHRegressorBase, Neuron
+from ._lazy import sp
 
 Factor = Tuple[int, float, int]
 Basis = Tuple[Factor, ...]

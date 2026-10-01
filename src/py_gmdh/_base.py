@@ -20,15 +20,13 @@ from itertools import combinations
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-import sympy as sp
-from scipy.optimize import minimize
-from scipy.special import expit
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, clone
-from sklearn.exceptions import ConvergenceWarning
-from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 from sklearn.utils.multiclass import check_classification_targets, type_of_target
 from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
+
+from ._lazy import sp
+from ._logistic import ConvergenceWarning, logistic_fit, sigmoid
 
 _SCALE_EPS = 1e-12
 _RANGE_EPS = 1e-10
@@ -55,12 +53,10 @@ def _ridge_solve(X: np.ndarray, y: np.ndarray, ridge: float) -> np.ndarray:
 def _logistic_solve(X: np.ndarray, y: np.ndarray, ridge: float) -> np.ndarray:
     """L2-penalized logistic regression without a separate intercept.
 
-    The design matrix already contains a constant column. ``ridge`` is the
-    inverse of scikit-learn's ``C``.
+    The design matrix already contains a constant column, which is penalized
+    like every other coefficient.
     """
-    model = LogisticRegression(C=1.0 / max(ridge, 1e-12), fit_intercept=False,
-                               solver="lbfgs", max_iter=1000)
-    return model.fit(X, y).coef_[0]
+    return logistic_fit(X, y, ridge)
 
 
 def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -84,15 +80,10 @@ def _fit_platt(scores: np.ndarray, t: np.ndarray) -> Tuple[float, float]:
     n_neg = float(len(t) - n_pos)
     target = np.where(t == 1, (n_pos + 1) / (n_pos + 2), 1 / (n_neg + 2))
 
-    def objective(params):
-        z = params[0] * scores + params[1]
-        residual = expit(z) - target
-        loss = float(np.sum(np.logaddexp(0.0, z) - target * z))
-        return loss, np.array([residual @ scores, residual.sum()])
-
     start = np.array([1.0, np.log((n_pos + 1) / (n_neg + 1))])
-    result = minimize(objective, start, jac=True, method="L-BFGS-B")
-    return float(result.x[0]), float(result.x[1])
+    a, b = logistic_fit(np.column_stack([scores, np.ones_like(scores)]), target, ridge=0.0,
+                        start=start)
+    return float(a), float(b)
 
 
 def _unit_scale(x, lo: float, hi: float):
@@ -513,7 +504,8 @@ class BaseGMDH(BaseEstimator):
             slope, intercept = calibration
             logit = self._output_expression(inputs, linear=True)
             with sp.evaluate(False):
-                score = sp.Float(slope) * logit + sp.Float(intercept)
+                clipped = sp.Min(sp.Max(logit, -_LOGIT_CLIP), _LOGIT_CLIP)
+                score = sp.Float(slope) * clipped + sp.Float(intercept)
             expr = _sigmoid_expression(score)
         if scale is not None:
             expr = expr * sp.Float(scale) + sp.Float(offset)
@@ -652,7 +644,8 @@ class GMDHClassifierBase(ClassifierMixin, BaseGMDH):
 
     With ``calibrate=True`` the output probability ``sigmoid(z)`` of the
     network is recalibrated by Platt scaling to ``sigmoid(a * z + b)``, where
-    ``z`` is the output neuron's logit. The two parameters are fitted on
+    ``z`` is the output neuron's logit clipped to ``[-30, 30]`` as in every
+    neuron. The two parameters are fitted on
     out-of-fold predictions: the network is refitted ``calibration_cv`` times
     on stratified folds of the data and predicts the held-out fold, so
     calibration never reuses data a network was built on. The final network
@@ -759,7 +752,8 @@ class GMDHClassifierBase(ClassifierMixin, BaseGMDH):
                           f"fitted ({error}); probabilities are left uncalibrated.",
                           UserWarning, stacklevel=3)
             return
-        self.calibration_slope_, self.calibration_intercept_ = _fit_platt(scores, t)
+        self.calibration_slope_, self.calibration_intercept_ = _fit_platt(
+            np.clip(scores, -_LOGIT_CLIP, _LOGIT_CLIP), t)
 
     @property
     def _is_calibrated(self) -> bool:
@@ -780,8 +774,8 @@ class GMDHClassifierBase(ClassifierMixin, BaseGMDH):
         """
         Z = self._scale_inputs(self._validate_predict_data(X))
         if self._is_calibrated:
-            p = expit(self.calibration_slope_ * self._forward(Z, linear=True)
-                      + self.calibration_intercept_)
+            z = np.clip(self._forward(Z, linear=True), -_LOGIT_CLIP, _LOGIT_CLIP)
+            p = sigmoid(self.calibration_slope_ * z + self.calibration_intercept_)
         else:
             p = self._forward(Z)
         return np.column_stack([1.0 - p, p])
@@ -863,6 +857,6 @@ class GMDHClassifierBase(ClassifierMixin, BaseGMDH):
         footer = f"P(y = {self.classes_[1]}) = output"
         if self._is_calibrated:
             footer = (f"P(y = {self.classes_[1]}) = sigmoid({self.calibration_slope_:.6g} * z "
-                      f"+ {self.calibration_intercept_:.6g}), where output = sigmoid(z) "
-                      "[Platt scaling]")
+                      f"+ {self.calibration_intercept_:.6g}), where output = sigmoid(z) and z "
+                      f"is clipped to [-{_LOGIT_CLIP:g}, {_LOGIT_CLIP:g}]  [Platt scaling]")
         return self._summary_text(feature_names, precision, footer)
