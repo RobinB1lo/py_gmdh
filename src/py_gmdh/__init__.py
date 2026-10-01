@@ -1,5 +1,6 @@
 """Group Method of Data Handling (GMDH) estimators with a scikit-learn API."""
 
+from ._base import EquationTooLongError
 from .aic import AICGMDH, AICGMDHClassifier
 from .cfp import CFPGMDH, CFPGMDHClassifier
 from .combi import CombiGMDH, CombiGMDHClassifier
@@ -16,6 +17,7 @@ from .ufp import UFPGMDH, UFPGMDHClassifier
 __version__ = "0.0.1"
 
 __all__ = [
+    "EquationTooLongError",
     "GMDH",
     "CombiGMDH",
     "HierarchicalGMDH",

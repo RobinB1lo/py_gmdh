@@ -34,8 +34,9 @@ print(model.equation(feature_names=["a", "b", "c"]))
 print(model.summary())
 ```
 
-`equation()` returns the whole network as a single formula in the original,
-unscaled features. `summary()` lists every neuron layer by layer. Every
+`equation()` returns the whole network as a single formula, written in the
+standardized inputs `z_k = (x_k - mean_k) / scale_k` whose definitions are
+listed below it. `summary()` lists every neuron layer by layer. Every
 estimator works with `Pipeline`, `GridSearchCV`, `clone` and the rest of
 scikit-learn.
 
@@ -104,7 +105,7 @@ print(model.summary())    # best model at every complexity level
 | --- | --- | --- |
 | `n_keep` | `10` | Neurons kept per layer |
 | `max_layers` | `10` | Maximum network depth |
-| `ridge` | `1e-6` | L2 regularization of each neuron (inverse of `C` for classifiers) |
+| `ridge` | `1e-6` | L2 regularization of each neuron |
 | `training_split` | `0.5` | Fraction of samples used to fit neurons; the rest ranks them |
 | `patience` | `0` | Non-improving layers tolerated before stopping |
 | `threshold` | `None` | Stop once the selection criterion reaches this value |
@@ -113,17 +114,41 @@ print(model.summary())    # best model at every complexity level
 ## Equations
 
 ```python
-model.equation()                  # "y = ..." with 4 significant digits
-model.equation(precision=None)    # full precision, reproduces predict()
-model.equation(expand=True)       # multiply out nested polynomials
-model.equation(as_sympy=True)     # sympy expression for further manipulation
+model.equation()                      # "y = ..." in z_k, coefficients shown to 4 digits
+model.equation(precision=None)        # every coefficient shown in full
+model.equation(expand=False)          # keep the nested form
+model.equation(variables="raw")       # write the equation in the original features
+expr, z = model.equation(as_sympy=True)   # full-precision sympy expression and z_k definitions
+expr.subs(z)                          # the same equation in the original features
 ```
 
-Polynomial regressors with up to three layers are expanded by default.
-Classifier equations are nested sigmoids and are left unexpanded unless
-`expand=True`, which multiplies out the first-layer arguments. The fully
-substituted equation grows quickly with depth, so for deep networks
-`summary()` is usually the more readable view.
+Example output (COMBI on features `year`, `temp`, `flow`):
+
+```text
+y = 2.715*z_flow*z_temp + 18.5*z_flow - 0.002098*z_temp**2 + 0.006123*z_temp*z_year - 0.07322*z_temp + 2.591*z_year**2 - 0.1811*z_year - 0.540358776249639
+where
+  z_year = (year - 1999.8209153927714) / 5.0890979827565275
+  z_temp = (temp - 19.97117283522831) / 2.925551012591963
+  z_flow = (flow + 0.02698699221270489) / 0.9263845069110179
+```
+
+- **Standardized variables.** Writing the equation in `z_k` keeps its
+  coefficients well conditioned. Expanding a polynomial directly in features
+  whose mean is large compared with their spread (for example a year) produces
+  huge coefficients that nearly cancel, so small rounding errors ruin the
+  result; `variables="raw"` issues a `RuntimeWarning` when that is likely.
+- **Rounding is for display only.** `precision` rounds the fitted
+  coefficients in the returned string; data-derived constants (means, scales,
+  input ranges, knots) are always shown in full, and `as_sympy=True` always
+  returns full precision, which reproduces `predict()`.
+- **Expansion.** Polynomial regressors with up to three layers are expanded by
+  default. Classifier equations are nested sigmoids and are left unexpanded
+  unless `expand=True`, which multiplies out the first-layer arguments.
+- **Size limit.** The substituted equation can grow exponentially with depth.
+  If it would exceed `max_length` (default 2000 variable occurrences),
+  `equation()` raises `EquationTooLongError`; reduce the number of parameters
+  (a smaller `max_layers` or `n_keep`, or fewer input features keeping the
+  most significant ones), use `summary()`, or pass `max_length=None`.
 
 ## License
 

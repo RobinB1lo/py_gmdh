@@ -15,8 +15,10 @@ neurons in a logistic link and fit them by penalized maximum likelihood.
 
 from __future__ import annotations
 
+import re
 import warnings
 from itertools import combinations
+from math import comb
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -33,6 +35,8 @@ _RANGE_EPS = 1e-10
 _PROBA_EPS = 1e-8
 _LOGIT_CLIP = 30.0
 _AUTO_EXPAND_MAX_DEPTH = 3
+_DEFAULT_MAX_LENGTH = 2000
+_UNSTABLE_EXPANSION = 1e-3
 
 IDENTITY = "identity"
 LOGISTIC = "logistic"
@@ -91,11 +95,49 @@ def _unit_scale(x, lo: float, hi: float):
     return (x - lo) / (hi - lo + _RANGE_EPS)
 
 
-def _round_floats(expr: sp.Expr, digits: int) -> sp.Expr:
-    """Round every floating-point constant in ``expr`` to ``digits`` significant digits."""
-    rounded = {f: sp.Float(float(f"{float(f):.{digits}g}")) for f in expr.atoms(sp.Float)}
-    with sp.evaluate(False):
-        return expr.xreplace(rounded)
+class EquationTooLongError(ValueError):
+    """Raised by ``equation()`` when the closed form would be too long to be useful."""
+
+
+def _check_precision(precision) -> None:
+    if precision is not None and (isinstance(precision, bool)
+                                  or not isinstance(precision, (int, np.integer))
+                                  or precision < 1):
+        raise ValueError(f"precision must be a positive integer or None, got {precision!r}.")
+
+
+def _number(value, digits: Optional[int] = None) -> sp.Float:
+    """SymPy constant for a fitted coefficient, rounded to ``digits`` significant digits.
+
+    Only fitted coefficients are rounded for display; constants derived from
+    the data (means, scales, ranges, knots) are always kept at full
+    precision, because small relative errors in them can change the output
+    by a large amount.
+    """
+    value = float(value)
+    if digits is not None:
+        value = float(f"{value:.{digits}g}")
+    return sp.Float(value)
+
+
+def _round_coefficients(expr: sp.Expr, digits: Optional[int],
+                        keep_constant: bool = True) -> sp.Expr:
+    """Round the coefficient of every term of an expanded sum.
+
+    With ``keep_constant`` the constant term is left at full precision; for
+    regressors it absorbs the target mean, which may be large compared with
+    the variation of the output.
+    """
+    if digits is None:
+        return expr
+    terms = []
+    for term in sp.Add.make_args(expr):
+        if term.is_Number:
+            terms.append(term if keep_constant else _number(term, digits))
+        else:
+            coefficient, rest = term.as_coeff_Mul()
+            terms.append(_number(coefficient, digits) * rest)
+    return sp.Add(*terms)
 
 
 def _sigmoid_expression(z: sp.Expr) -> sp.Expr:
@@ -104,18 +146,29 @@ def _sigmoid_expression(z: sp.Expr) -> sp.Expr:
         return 1 / (1 + sp.exp(-z))
 
 
-def _expand_sigmoid_arguments(expr: sp.Expr) -> sp.Expr:
+def _expand_sigmoid_arguments(expr: sp.Expr, digits: Optional[int] = None) -> sp.Expr:
     """Multiply out the innermost sigmoid arguments, which are functions of the inputs only."""
-    replacements = {node: sp.exp(sp.expand(node.args[0]), evaluate=False)
+    replacements = {node: sp.exp(_round_coefficients(sp.expand(node.args[0]), digits,
+                                                     keep_constant=False), evaluate=False)
                     for node in expr.atoms(sp.exp) if not node.args[0].has(sp.exp)}
     with sp.evaluate(False):
         return expr.xreplace(replacements)
 
 
-def _format_expr(expr: sp.Expr, precision: Optional[int]) -> str:
-    if precision is not None:
-        expr = _round_floats(expr, precision)
-    return sp.sstr(expr)
+def _scaled_term(coefficient: sp.Float, term) -> sp.Expr:
+    """``coefficient * term`` without distributing the coefficient over a sum.
+
+    Distributing would multiply rounded coefficients together and print more
+    digits than requested; the result is mathematically the same.
+    """
+    if term == 1:
+        return coefficient
+    return sp.Mul(coefficient, term, evaluate=False)
+
+
+def _definition(z: str, name: str, mean: float, scale: float) -> str:
+    sign = "-" if mean >= 0 else "+"
+    return f"  {z} = ({name} {sign} {abs(mean)!r}) / {scale!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -186,20 +239,32 @@ class Neuron:
         """Output before the link function (the logit for logistic neurons)."""
         return self.design_matrix(a, b) @ self.w
 
-    def _linear_expression(self, a, b) -> sp.Expr:
-        return sp.Add(*[sp.Float(float(w)) * t
-                        for w, t in zip(self.w, self.terms(a, b, sp))])
+    def _linear_expression(self, a, b, digits: Optional[int] = None, scale: float = 1.0,
+                           offset: float = 0.0) -> sp.Expr:
+        """``scale * (w · phi(a, b)) + offset``, coefficients rounded to ``digits``.
 
-    def expression(self, a: sp.Expr, b: sp.Expr) -> sp.Expr:
+        The first basis function is the constant, so ``offset`` (kept at full
+        precision) is added to the intercept.
+        """
+        expr = sp.Add(*[_scaled_term(_number(scale * w, digits), t)
+                        for w, t in zip(self.w, self.terms(a, b, sp))])
+        return expr + sp.Float(float(offset)) if offset else expr
+
+    def expression(self, a: sp.Expr, b: sp.Expr, digits: Optional[int] = None) -> sp.Expr:
         """Symbolic form of the fitted neuron with inputs ``a`` and ``b``."""
-        linear = self._linear_expression(a, b)
+        linear = self._linear_expression(a, b, digits)
         if self.link == LOGISTIC:
             return _sigmoid_expression(linear)
         return linear
 
+    def _input_multiplicity(self) -> Tuple[int, int]:
+        """Number of times each input occurs in the neuron's symbolic expression."""
+        a, b = sp.Dummy("a"), sp.Dummy("b")
+        nodes = list(sp.preorder_traversal(self.expression(a, b)))
+        return sum(node == a for node in nodes), sum(node == b for node in nodes)
+
     def _describe_linear(self, a_name: str, b_name: str, precision: Optional[int]) -> str:
-        return _format_expr(self._linear_expression(sp.Symbol(a_name), sp.Symbol(b_name)),
-                            precision)
+        return sp.sstr(self._linear_expression(sp.Symbol(a_name), sp.Symbol(b_name), precision))
 
     def describe(self, a_name: str, b_name: str, precision: Optional[int] = 4) -> str:
         """Human-readable formula of the neuron in terms of named inputs."""
@@ -392,10 +457,26 @@ class BaseGMDH(BaseEstimator):
                              f"got {len(feature_names)}.")
         return [sp.Symbol(name) for name in feature_names]
 
-    def _scaled_input_expressions(self, feature_names) -> List[sp.Expr]:
-        symbols = self._feature_symbols(feature_names)
+    def _scaled_input_expressions(self, symbols) -> List[sp.Expr]:
         return [(s - float(m)) / float(d)
                 for s, m, d in zip(symbols, self.x_mean_, self.x_scale_)]
+
+    @staticmethod
+    def _standardized_symbols(symbols) -> List[sp.Symbol]:
+        """``z0, z1, ...`` for default names, otherwise ``z_<name>`` (made identifier-safe)."""
+        names = [s.name for s in symbols]
+        if names == [f"x{k}" for k in range(len(names))]:
+            return [sp.Symbol(f"z{k}") for k in range(len(names))]
+        taken = set(names)
+        result = []
+        for name in names:
+            base = "z_" + (re.sub(r"\W", "_", name) or "_")
+            candidate, k = base, 1
+            while candidate in taken:
+                candidate, k = f"{base}_{k}", k + 1
+            taken.add(candidate)
+            result.append(sp.Symbol(candidate))
+        return result
 
     # -- network search -----------------------------------------------------
 
@@ -452,7 +533,10 @@ class BaseGMDH(BaseEstimator):
         a, b = Z[:, neuron.i], Z[:, neuron.j]
         return neuron.linear_predict(a, b) if linear else neuron.predict(a, b)
 
-    def _output_expression(self, inputs: List[sp.Expr], linear: bool = False) -> sp.Expr:
+    def _output_expression(self, inputs: List[sp.Expr], linear: bool = False,
+                           digits: Optional[int] = None, scale: float = 1.0,
+                           offset: float = 0.0) -> sp.Expr:
+        """Symbolic network output; ``scale`` and ``offset`` apply to a linear output."""
         memo: Dict[Tuple[int, int], sp.Expr] = {}
 
         def arguments(depth: int, neuron: Neuron):
@@ -464,17 +548,47 @@ class BaseGMDH(BaseEstimator):
             key = (depth, index)
             if key not in memo:
                 neuron = self.layers_[depth].neurons[index]
-                memo[key] = neuron.expression(*arguments(depth, neuron))
+                memo[key] = neuron.expression(*arguments(depth, neuron), digits)
             return memo[key]
 
         depth = len(self.layers_) - 1
         output = self.layers_[depth].neurons[0]
-        if linear:
-            return output._linear_expression(*arguments(depth, output))
+        if linear or self._link == IDENTITY:
+            return output._linear_expression(*arguments(depth, output), digits, scale, offset)
         return node(depth, 0)
 
     def _depth(self) -> int:
         return len(self.layers_)
+
+    def _polynomial_degree(self) -> int:
+        """Upper bound on the degree of the expanded equation of a polynomial network."""
+        return 2 ** self._depth()
+
+    def _equation_size(self) -> Tuple[int, set]:
+        """Variable occurrences in the nested equation and the features it uses.
+
+        Each neuron repeats an input as often as the input appears in its own
+        formula (three times for the quadratic neuron), so the count can grow
+        exponentially with depth. It is computed from the network structure
+        without building the equation.
+        """
+        memo: Dict[Tuple[int, int], Tuple[int, set]] = {}
+
+        def visit(depth: int, index: int) -> Tuple[int, set]:
+            key = (depth, index)
+            if key not in memo:
+                neuron = self.layers_[depth].neurons[index]
+                count_a, count_b = neuron._input_multiplicity()
+                if depth == 0:
+                    features = {k for k, c in ((neuron.i, count_a), (neuron.j, count_b)) if c}
+                    memo[key] = (count_a + count_b, features)
+                else:
+                    size_a, feat_a = visit(depth - 1, neuron.i) if count_a else (0, set())
+                    size_b, feat_b = visit(depth - 1, neuron.j) if count_b else (0, set())
+                    memo[key] = (count_a * size_a + count_b * size_b, feat_a | feat_b)
+            return memo[key]
+
+        return visit(len(self.layers_) - 1, 0)
 
     def _summary_body(self, names: List[str], precision: Optional[int]) -> List[str]:
         lines = []
@@ -484,7 +598,7 @@ class BaseGMDH(BaseEstimator):
             lines.append(f"Layer {depth + 1} ({len(layer.neurons)} neurons; best: {metrics})")
             outputs = []
             for index, neuron in enumerate(layer.neurons):
-                name = f"z{depth + 1}_{index}"
+                name = f"n{depth + 1}_{index}"
                 formula = neuron.describe(inputs[neuron.i], inputs[neuron.j], precision)
                 lines.append(f"  {name} = {formula}")
                 outputs.append(name)
@@ -494,36 +608,113 @@ class BaseGMDH(BaseEstimator):
 
     # -- shared public helpers ------------------------------------------------
 
-    def _network_expression(self, feature_names, precision, expand, scale=None, offset=None,
-                            calibration=None):
-        check_is_fitted(self, self._fitted_attr)
-        inputs = self._scaled_input_expressions(feature_names)
+    def _build_expression(self, inputs, digits, expand, scale=1.0, offset=0.0,
+                          calibration=None) -> sp.Expr:
         if calibration is None:
-            expr = self._output_expression(inputs)
+            expr = self._output_expression(inputs, digits=digits, scale=scale, offset=offset)
         else:
             slope, intercept = calibration
-            logit = self._output_expression(inputs, linear=True)
+            logit = self._output_expression(inputs, linear=True, digits=digits)
             with sp.evaluate(False):
                 clipped = sp.Min(sp.Max(logit, -_LOGIT_CLIP), _LOGIT_CLIP)
-                score = sp.Float(slope) * clipped + sp.Float(intercept)
+                score = _number(slope, digits) * clipped + _number(intercept, digits)
             expr = _sigmoid_expression(score)
-        if scale is not None:
-            expr = expr * sp.Float(scale) + sp.Float(offset)
+        if expand:
+            if self._link == LOGISTIC:
+                expr = _expand_sigmoid_arguments(expr, digits if self._expandable else None)
+            else:
+                expr = sp.expand(expr)
+                if self._expandable:
+                    expr = _round_coefficients(expr, digits)
+        return expr
+
+    def _check_equation_size(self, expand: bool, max_length: Optional[int]) -> set:
+        size, used = self._equation_size()
+        what = "variable occurrences"
+        if expand and self._expandable and self._link == IDENTITY:
+            degree = self._polynomial_degree()
+            terms = comb(len(used) + degree, degree)
+            if terms > size:
+                size, what = terms, "terms (upper bound for the expanded polynomial)"
+        if max_length is not None and size > max_length:
+            raise EquationTooLongError(
+                f"The equation is too long to be useful: it would contain about {size:,} "
+                f"{what}, more than max_length={max_length:,}. Reduce the number of "
+                "parameters of the model, for example by fitting with a smaller max_layers or "
+                "n_keep, or with fewer input features (keeping the most significant ones), and "
+                "refit. summary() describes the current model layer by layer. Pass "
+                "max_length=None to build the equation anyway.")
+        return used
+
+    def _warn_if_unstable(self, used: set, digits: Optional[int], degree: int) -> None:
+        """Warn when a raw-variable expansion is numerically ill-conditioned.
+
+        Expanding a polynomial of degree ``d`` in ``x = mean + scale * z``
+        produces coefficients of size about ``(1 + |mean| / scale) ** d`` that
+        cancel when the equation is evaluated, so relative errors of
+        ``10**-digits`` in the printed coefficients are amplified by that factor.
+        """
+        if not used:
+            return
+        ratio = max(abs(float(self.x_mean_[k])) / float(self.x_scale_[k]) for k in used)
+        amplification = (1.0 + ratio) ** degree
+        if amplification * 10.0 ** -(digits if digits is not None else 15) > _UNSTABLE_EXPANSION:
+            warnings.warn(
+                "The expanded equation in raw variables is numerically ill-conditioned: some "
+                f"features have |mean| / scale up to {ratio:.3g}, so its coefficients nearly "
+                "cancel and small rounding errors are amplified about "
+                f"{amplification:.2g}-fold. Use variables='standardized' (the default) or "
+                "expand=False for an accurate equation.", RuntimeWarning, stacklevel=3)
+
+    def _equation(self, lhs: str, feature_names, precision, expand, as_sympy, variables,
+                  max_length, scale=1.0, offset=0.0, calibration=None):
+        check_is_fitted(self, self._fitted_attr)
+        _check_precision(precision)
+        if variables not in ("standardized", "raw"):
+            raise ValueError(f"variables must be 'standardized' or 'raw', got {variables!r}.")
+        if max_length is not None and max_length < 1:
+            raise ValueError(f"max_length must be a positive integer or None, got {max_length!r}.")
+        symbols = self._feature_symbols(feature_names)
         if expand is None:
             expand = self._expandable and self._depth() <= _AUTO_EXPAND_MAX_DEPTH
-        if expand:
-            expr = _expand_sigmoid_arguments(expr) if self._link == LOGISTIC else sp.expand(expr)
-        if precision is not None:
-            expr = _round_floats(expr, precision)
-        return expr
+        used = self._check_equation_size(expand, max_length)
+
+        standardized = variables == "standardized"
+        z_symbols = self._standardized_symbols(symbols) if standardized else None
+        inputs = z_symbols if standardized else self._scaled_input_expressions(symbols)
+        digits = None if as_sympy else precision
+        expr = self._build_expression(inputs, digits, expand, scale, offset, calibration)
+        if not standardized and expand and self._expandable:
+            degree = self._polynomial_degree() if self._link == IDENTITY else 2
+            self._warn_if_unstable(used, digits, degree)
+
+        present = expr.free_symbols
+        indices = [k for k in range(len(symbols)) if standardized and z_symbols[k] in present]
+        if as_sympy:
+            if not standardized:
+                return expr
+            definitions = {z_symbols[k]: (symbols[k] - float(self.x_mean_[k]))
+                           / float(self.x_scale_[k]) for k in indices}
+            return expr, definitions
+        text = f"{lhs} = {sp.sstr(expr)}"
+        if indices:
+            text += "\nwhere\n" + "\n".join(
+                _definition(z_symbols[k].name, symbols[k].name, float(self.x_mean_[k]),
+                            float(self.x_scale_[k])) for k in indices)
+        return text
 
     def _summary_text(self, feature_names, precision, footer: str) -> str:
         check_is_fitted(self, self._fitted_attr)
-        names = [s.name for s in self._feature_symbols(feature_names)]
+        _check_precision(precision)
+        symbols = self._feature_symbols(feature_names)
+        z_symbols = self._standardized_symbols(symbols)
         header = [f"{type(self).__name__} (selection criterion: {self._criterion}, "
                   f"best score: {self.best_score_:.6g})",
-                  "Inputs are standardized: z = (x - mean) / scale.", ""]
-        return "\n".join(header + self._summary_body(names, precision) + ["", footer])
+                  "Inputs are standardized:"]
+        header += [_definition(z.name, x.name, float(m), float(d))
+                   for z, x, m, d in zip(z_symbols, symbols, self.x_mean_, self.x_scale_)]
+        body = self._summary_body([z.name for z in z_symbols], precision)
+        return "\n".join(header + [""] + body + ["", footer])
 
 
 class GMDHRegressorBase(RegressorMixin, BaseGMDH):
@@ -577,11 +768,15 @@ class GMDHRegressorBase(RegressorMixin, BaseGMDH):
 
     def equation(self, feature_names: Optional[Sequence[str]] = None,
                  precision: Optional[int] = 4, expand: Optional[bool] = None,
-                 as_sympy: bool = False):
+                 as_sympy: bool = False, variables: str = "standardized",
+                 max_length: Optional[int] = _DEFAULT_MAX_LENGTH):
         """Closed-form equation of the fitted network.
 
-        The equation is written in terms of the original, unstandardized
-        features; all intermediate neurons are substituted in.
+        All neurons are substituted into a single equation. By default it is
+        written in the standardized inputs ``z_k = (x_k - mean_k) / scale_k``,
+        whose definitions are listed below the equation; this keeps the
+        coefficients well conditioned when a feature's mean is large compared
+        with its spread.
 
         Parameters
         ----------
@@ -589,25 +784,44 @@ class GMDHRegressorBase(RegressorMixin, BaseGMDH):
             Names used for the input variables. Defaults to the column names
             seen during :meth:`fit`, or ``x0, x1, ...``.
         precision : int or None, default=4
-            Number of significant digits kept for every constant. ``None``
-            keeps full precision, which reproduces :meth:`predict` exactly.
+            Significant digits shown for the fitted coefficients in the
+            returned string. Rounding is for display only: constants derived
+            from the data (means, scales, ranges, knots) are always shown in
+            full, and ``as_sympy=True`` always returns full precision.
+            ``None`` shows every coefficient in full.
         expand : bool or None, default=None
             Whether to multiply the nested expression out. By default the
             equation is expanded only for polynomial networks with at most
             three layers; deeper networks grow combinatorially when expanded.
         as_sympy : bool, default=False
-            Return a :class:`sympy.Expr` for the right-hand side instead of a
-            string.
+            Return SymPy objects instead of a string: the full-precision
+            right-hand side and, with standardized variables, a dict mapping
+            each ``z_k`` symbol to its definition in the original feature
+            (``expr.subs(definitions)`` gives the equation in raw variables).
+        variables : {"standardized", "raw"}, default="standardized"
+            Write the equation in the standardized inputs ``z_k`` or directly
+            in the original features. An expanded equation in raw variables
+            can be numerically ill-conditioned for features whose mean is
+            large relative to their scale; a ``RuntimeWarning`` is issued
+            when that is likely.
+        max_length : int or None, default=2000
+            Largest equation that is built, measured in variable occurrences
+            (or terms, for an expanded polynomial). Larger equations raise
+            :class:`EquationTooLongError`; ``None`` removes the limit.
 
         Returns
         -------
-        equation : str or sympy.Expr
-            ``"y = ..."`` or the SymPy expression of the right-hand side.
+        equation : str, sympy.Expr or (sympy.Expr, dict)
+            ``"y = ..."`` followed by the ``z_k`` definitions, or the SymPy
+            objects described under ``as_sympy``.
+
+        Raises
+        ------
+        EquationTooLongError
+            If the equation would exceed ``max_length``.
         """
-        check_is_fitted(self, self._fitted_attr)
-        expr = self._network_expression(feature_names, precision, expand,
-                                        scale=self.y_scale_, offset=self.y_mean_)
-        return expr if as_sympy else f"y = {sp.sstr(expr)}"
+        return self._equation("y", feature_names, precision, expand, as_sympy, variables,
+                              max_length, scale=self.y_scale_, offset=self.y_mean_)
 
     def summary(self, feature_names: Optional[Sequence[str]] = None,
                 precision: Optional[int] = 4) -> str:
@@ -628,7 +842,8 @@ class GMDHRegressorBase(RegressorMixin, BaseGMDH):
         summary : str
         """
         check_is_fitted(self, self._fitted_attr)
-        footer = f"y = output * {self.y_scale_:.6g} + {self.y_mean_:.6g}"
+        sign = "-" if self.y_mean_ < 0 else "+"
+        footer = f"y = output * {self.y_scale_:.6g} {sign} {abs(self.y_mean_):.6g}"
         return self._summary_text(feature_names, precision, footer)
 
 
@@ -798,12 +1013,14 @@ class GMDHClassifierBase(ClassifierMixin, BaseGMDH):
 
     def equation(self, feature_names: Optional[Sequence[str]] = None,
                  precision: Optional[int] = 4, expand: Optional[bool] = None,
-                 as_sympy: bool = False):
+                 as_sympy: bool = False, variables: str = "standardized",
+                 max_length: Optional[int] = _DEFAULT_MAX_LENGTH):
         """Closed-form equation for the probability of the positive class.
 
-        The equation is written in terms of the original, unstandardized
-        features; all intermediate neurons are substituted in, so it is a
-        nested composition of sigmoids.
+        All neurons are substituted in, so the equation is a nested
+        composition of sigmoids. By default it is written in the standardized
+        inputs ``z_k = (x_k - mean_k) / scale_k``, whose definitions are
+        listed below the equation.
 
         Parameters
         ----------
@@ -811,28 +1028,46 @@ class GMDHClassifierBase(ClassifierMixin, BaseGMDH):
             Names used for the input variables. Defaults to the column names
             seen during :meth:`fit`, or ``x0, x1, ...``.
         precision : int or None, default=4
-            Number of significant digits kept for every constant. ``None``
-            keeps full precision, which reproduces :meth:`predict_proba`.
+            Significant digits shown for the fitted coefficients in the
+            returned string. Rounding is for display only: constants derived
+            from the data (means, scales, ranges, knots) are always shown in
+            full, and ``as_sympy=True`` always returns full precision.
+            ``None`` shows every coefficient in full.
         expand : bool or None, default=None
             Whether to multiply out the arguments of the first-layer
             sigmoids, which are polynomials of the inputs for polynomial
             neurons. Off by default.
         as_sympy : bool, default=False
-            Return a :class:`sympy.Expr` for the right-hand side instead of a
-            string.
+            Return SymPy objects instead of a string: the full-precision
+            right-hand side and, with standardized variables, a dict mapping
+            each ``z_k`` symbol to its definition in the original feature
+            (``expr.subs(definitions)`` gives the equation in raw variables).
+        variables : {"standardized", "raw"}, default="standardized"
+            Write the equation in the standardized inputs ``z_k`` or directly
+            in the original features. With ``expand=True`` an equation in raw
+            variables can be numerically ill-conditioned for features whose
+            mean is large relative to their scale; a ``RuntimeWarning`` is
+            issued when that is likely.
+        max_length : int or None, default=2000
+            Largest equation that is built, measured in variable
+            occurrences. Larger equations raise
+            :class:`EquationTooLongError`; ``None`` removes the limit.
 
         Returns
         -------
-        equation : str or sympy.Expr
-            ``"P(y = <positive class>) = ..."`` or the SymPy expression of the
-            right-hand side.
+        equation : str, sympy.Expr or (sympy.Expr, dict)
+            ``"P(y = <positive class>) = ..."`` followed by the ``z_k``
+            definitions, or the SymPy objects described under ``as_sympy``.
+
+        Raises
+        ------
+        EquationTooLongError
+            If the equation would exceed ``max_length``.
         """
-        check_is_fitted(self, self._fitted_attr)
         calibration = ((self.calibration_slope_, self.calibration_intercept_)
                        if self._is_calibrated else None)
-        expr = self._network_expression(feature_names, precision, expand,
-                                        calibration=calibration)
-        return expr if as_sympy else f"P(y = {self.classes_[1]}) = {sp.sstr(expr)}"
+        return self._equation(f"P(y = {self.classes_[1]})", feature_names, precision, expand,
+                              as_sympy, variables, max_length, calibration=calibration)
 
     def summary(self, feature_names: Optional[Sequence[str]] = None,
                 precision: Optional[int] = 4) -> str:

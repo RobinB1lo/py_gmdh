@@ -7,7 +7,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from ._base import GMDHClassifierBase, GMDHRegressorBase, Neuron
+from ._base import IDENTITY, GMDHClassifierBase, GMDHRegressorBase, Neuron
 from ._lazy import sp
 
 _SCOPES = ("all", "inputs")
@@ -134,7 +134,9 @@ class _LookbackNetwork:
                 values[node.id] = n.linear_predict(a, b) if linear and last else n.predict(a, b)
         return values[self.output_node_.id]
 
-    def _output_expression(self, inputs: List[sp.Expr], linear: bool = False) -> sp.Expr:
+    def _output_expression(self, inputs: List[sp.Expr], linear: bool = False,
+                           digits: Optional[int] = None, scale: float = 1.0,
+                           offset: float = 0.0) -> sp.Expr:
         exprs: Dict[int, sp.Expr] = {}
         for node in self.nodes_:
             if isinstance(node, InputNode):
@@ -142,10 +144,24 @@ class _LookbackNetwork:
             else:
                 n = node.neuron
                 a, b = exprs[n.i], exprs[n.j]
-                last = node is self.output_node_
-                exprs[node.id] = (n._linear_expression(a, b) if linear and last
-                                  else n.expression(a, b))
+                if node is self.output_node_ and (linear or self._link == IDENTITY):
+                    exprs[node.id] = n._linear_expression(a, b, digits, scale, offset)
+                else:
+                    exprs[node.id] = n.expression(a, b, digits)
         return exprs[self.output_node_.id]
+
+    def _equation_size(self):
+        sizes: Dict[int, tuple] = {}
+        for node in self.nodes_:
+            if isinstance(node, InputNode):
+                sizes[node.id] = (1, {node.index})
+            else:
+                n = node.neuron
+                count_a, count_b = n._input_multiplicity()
+                size_a, feat_a = sizes[n.i] if count_a else (0, set())
+                size_b, feat_b = sizes[n.j] if count_b else (0, set())
+                sizes[node.id] = (count_a * size_a + count_b * size_b, feat_a | feat_b)
+        return sizes[self.output_node_.id]
 
     def _depth(self) -> int:
         return self.output_node_.depth

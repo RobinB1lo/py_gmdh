@@ -18,7 +18,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from ._base import (_LOGIT_CLIP, _PROBA_EPS, LOGISTIC, GMDHClassifierBase, GMDHRegressorBase,
-                    _format_expr, _logistic_solve, _ridge_solve, _sigmoid_expression)
+                    _logistic_solve, _number, _ridge_solve, _scaled_term,
+                    _sigmoid_expression)
 from ._lazy import sp
 from ._logistic import sigmoid
 
@@ -223,18 +224,30 @@ class _CombinatorialSearch:
             return 1.0 / (1.0 + np.exp(-np.clip(z, -_LOGIT_CLIP, _LOGIT_CLIP)))
         return z
 
-    def _linear_expression(self, inputs: List[sp.Expr]) -> sp.Expr:
+    def _linear_expression(self, inputs: List[sp.Expr], digits: Optional[int] = None,
+                           scale: float = 1.0, offset: float = 0.0) -> sp.Expr:
         monomials = [1] + [sp.Mul(*[inputs[k] for k in term]) for term in self.terms_]
-        return sp.Add(*[sp.Float(float(w)) * m for w, m in zip(self.coef_, monomials)])
+        expr = sp.Add(*[_scaled_term(_number(scale * w, digits), m)
+                        for w, m in zip(self.coef_, monomials)])
+        return expr + sp.Float(float(offset)) if offset else expr
 
-    def _output_expression(self, inputs: List[sp.Expr], linear: bool = False) -> sp.Expr:
-        expr = self._linear_expression(inputs)
+    def _output_expression(self, inputs: List[sp.Expr], linear: bool = False,
+                           digits: Optional[int] = None, scale: float = 1.0,
+                           offset: float = 0.0) -> sp.Expr:
+        expr = self._linear_expression(inputs, digits, scale, offset)
         if self._link == LOGISTIC and not linear:
             return _sigmoid_expression(expr)
         return expr
 
     def _depth(self) -> int:
         return 1
+
+    def _polynomial_degree(self) -> int:
+        return max((len(term) for term in self.terms_), default=0)
+
+    def _equation_size(self):
+        used = {k for term in self.terms_ for k in term}
+        return sum(len(term) for term in self.terms_), used
 
     def _summary_body(self, names: List[str], precision: Optional[int]) -> List[str]:
         def monomial(term):
@@ -251,7 +264,7 @@ class _CombinatorialSearch:
             marker = "*" if level is best else " "
             lines.append(f" {marker} {level['n_terms']:2d} terms  {self._criterion}="
                          f"{level['score']:.6g}  [{label(level['terms'])}]")
-        formula = _format_expr(self._linear_expression([sp.Symbol(n) for n in names]), precision)
+        formula = sp.sstr(self._linear_expression([sp.Symbol(n) for n in names], precision))
         if self._link == LOGISTIC:
             formula = f"sigmoid({formula})"
         lines += ["", f"Selected model: output = {formula}"]

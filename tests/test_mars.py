@@ -28,7 +28,8 @@ def test_fit_mars_recovers_hinge_function():
 def test_equation_reproduces_predictions(data):
     X, y, X_new = data
     model = MARSGMDH(n_keep=4, max_layers=3, patience=2, random_state=0).fit(X, y)
-    expr = model.equation(precision=None, as_sympy=True)
+    expr, definitions = model.equation(as_sympy=True)
+    expr = expr.subs(definitions)
     f = sp.lambdify(sp.symbols("x0:4"), expr, "numpy")
     np.testing.assert_allclose(f(*X_new.T), model.predict(X_new), rtol=1e-9)
     assert isinstance(model.summary(), str)

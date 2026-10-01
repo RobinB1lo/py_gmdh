@@ -33,7 +33,8 @@ def _evaluate(expr, X):
 def test_equation_reproduces_probabilities(cls, data):
     X, y, X_new = data
     model = _make(cls, max_terms=3, n_keep=3, max_layers=2, ridge=1e-2, random_state=0).fit(X, y)
-    expr = model.equation(precision=None, as_sympy=True)
+    expr, definitions = model.equation(as_sympy=True)
+    expr = expr.subs(definitions)
     np.testing.assert_allclose(_evaluate(expr, X_new), model.predict_proba(X_new)[:, 1],
                                rtol=1e-7, atol=1e-9)
 
